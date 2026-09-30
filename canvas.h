@@ -10,13 +10,14 @@ class QPaintEvent;
 
 class Canvas final : public QWidget {
 public:
-    enum class Mode { DrawBoundary, Fill, BresenhamLine };
+    enum class Mode { DrawBoundary, Fill, TextureFill, BresenhamLine, WuLine };
 
     explicit Canvas(QWidget *parent = nullptr);
 
     void setMode(Mode mode);
     void setBoundaryColor(const QColor &color);
     void setFillColor(const QColor &color);
+    void setTexture(const QImage &texture);
     void clear();
 
 protected:
@@ -30,14 +31,19 @@ private:
     [[nodiscard]] QPoint bounded(const QPoint &point) const;
 
     void putPixel(int x, int y, const QColor &color);
+    void blendPixel(int x, int y, const QColor &color, double coverage);
     void drawBresenham(QPoint from, const QPoint &to, const QColor &color);
+    void drawWu(QPoint from, QPoint to, const QColor &color);
     void fillFrom(const QPoint &seed);
     void fillSpan(int x, int y, QRgb oldColor, QRgb newColor);
+    void fillTextureFrom(const QPoint &seed);
+    void fillTextureSpan(int x, int y, QRgb oldColor, QImage &visited);
 
     QImage image_;
     Mode mode_ = Mode::DrawBoundary;
     QColor boundaryColor_ = Qt::black;
     QColor fillColor_ = QColor(65, 145, 255);
+    QImage texture_;
     QPoint previousPoint_;
     QPoint lineStart_;
     bool mouseDown_ = false;

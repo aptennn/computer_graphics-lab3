@@ -25,6 +25,10 @@ void Canvas::setFillColor(const QColor &color) {
     fillColor_ = color;
 }
 
+void Canvas::setTexture(const QImage &texture) {
+    texture_ = texture.convertToFormat(QImage::Format_ARGB32);
+}
+
 void Canvas::clear() {
     image_.fill(Qt::white);
     update();
@@ -51,6 +55,13 @@ void Canvas::mousePressEvent(QMouseEvent *event) {
     if (mode_ == Mode::Fill) {
         fillFrom(point);
         update();
+        return;
+    }
+    if (mode_ == Mode::TextureFill) {
+        if (!texture_.isNull()) {
+            fillTextureFrom(point);
+            update();
+        }
         return;
     }
 
@@ -84,6 +95,8 @@ void Canvas::mouseReleaseEvent(QMouseEvent *event) {
         drawBresenham(previousPoint_, point, boundaryColor_);
     } else if (mode_ == Mode::BresenhamLine) {
         drawBresenham(lineStart_, point, boundaryColor_);
+    } else if (mode_ == Mode::WuLine) {
+        drawWu(lineStart_, point, boundaryColor_);
     }
     mouseDown_ = false;
     update();
@@ -102,6 +115,22 @@ void Canvas::putPixel(int x, int y, const QColor &color) {
     if (x >= 0 && x < image_.width() && y >= 0 && y < image_.height()) {
         image_.setPixelColor(x, y, color);
     }
+}
+
+// Михаил: смешивание с фоном по доле покрытия пикселя для алгоритма Ву и прозрачных текстур.
+void Canvas::blendPixel(int x, int y, const QColor &color, double coverage) {
+    if (x < 0 || x >= image_.width() || y < 0 || y >= image_.height()) {
+        return;
+    }
+    const double alpha = std::clamp(coverage * color.alphaF(), 0.0, 1.0);
+    if (alpha == 0.0) {
+        return;
+    }
+    const QColor background = image_.pixelColor(x, y);
+    image_.setPixel(x, y, qRgb(
+        qRound(color.red() * alpha + background.red() * (1.0 - alpha)),
+        qRound(color.green() * alpha + background.green() * (1.0 - alpha)),
+        qRound(color.blue() * alpha + background.blue() * (1.0 - alpha))));
 }
 
 // Егор: целочисленный Брезенхем для любых направлений отрезка.
@@ -131,6 +160,43 @@ void Canvas::drawBresenham(QPoint from, const QPoint &to, const QColor &color) {
             y0 += sy;
         }
     }
+}
+
+// Михаил: алгоритм Ву. Для каждого шага по главной оси распределяем яркость
+// между двумя ближайшими пикселями пропорционально покрытию отрезком.
+void Canvas::drawWu(QPoint from, QPoint to, const QColor &color) {
+    bool steep = std::abs(to.y() - from.y()) > std::abs(to.x() - from.x());
+    if (steep) {
+        from = QPoint(from.y(), from.x());
+        to = QPoint(to.y(), to.x());
+    }
+    if (from.x() > to.x()) {
+        std::swap(from, to);
+    }
+
+    const auto plot = [this, steep, &color](int x, int y, double coverage) {
+        if (steep) {
+            blendPixel(y, x, color, coverage);
+        } else {
+            blendPixel(x, y, color, coverage);
+        }
+    };
+
+    const int dx = to.x() - from.x();
+    if (dx == 0) {
+        plot(from.x(), from.y(), 1.0);
+        return;
+    }
+    const double gradient = static_cast<double>(to.y() - from.y()) / dx;
+    plot(from.x(), from.y(), 1.0);
+    double y = from.y() + gradient;
+    for (int x = from.x() + 1; x < to.x(); ++x, y += gradient) {
+        const int lower = static_cast<int>(std::floor(y));
+        const double fraction = y - lower;
+        plot(x, lower, 1.0 - fraction);
+        plot(x, lower + 1, fraction);
+    }
+    plot(to.x(), to.y(), 1.0);
 }
 
 void Canvas::fillFrom(const QPoint &seed) {
@@ -175,6 +241,59 @@ void Canvas::fillSpan(int x, int y, QRgb oldColor, QRgb newColor) {
                 fillSpan(currentX, nextY, oldColor, newColor);
                 while (currentX <= right && image_.pixel(currentX, nextY) != oldColor) {
                     ++currentX;
+                }
+            }
+        }
+    }
+}
+
+void Canvas::fillTextureFrom(const QPoint &seed) {
+    const QRgb oldColor = image_.pixel(seed);
+    QImage visited(image_.size(), QImage::Format_Grayscale8);
+    visited.fill(0);
+    fillTextureSpan(seed.x(), seed.y(), oldColor, visited);
+}
+
+// Михаил: рекурсивная заливка текстурой по сериям. Маска посещения нужна, потому что пиксель
+// текстуры может совпасть с исходным цветом или быть прозрачным.
+void Canvas::fillTextureSpan(int x, int y, QRgb oldColor, QImage &visited) {
+    const auto available = [this, oldColor, &visited](int px, int py) {
+        return px >= 0 && px < image_.width() && py >= 0 && py < image_.height()
+               && visited.constScanLine(py)[px] == 0 && image_.pixel(px, py) == oldColor;
+    };
+    if (!available(x, y)) {
+        return;
+    }
+
+    int left = x;
+    int right = x;
+    while (available(left - 1, y)) {
+        --left;
+    }
+    while (available(right + 1, y)) {
+        ++right;
+    }
+    for (int px = left; px <= right; ++px) {
+        visited.scanLine(y)[px] = 1;
+        // Привязка к холсту: маленькая текстура повторяется по обеим осям,
+        // большая используется в исходном размере без масштабирования.
+        const QRgb texel = texture_.pixel(px % texture_.width(), y % texture_.height());
+        blendPixel(px, y, QColor::fromRgba(texel), 1.0);
+    }
+
+    for (const int nextY : {y - 1, y + 1}) {
+        if (nextY < 0 || nextY >= image_.height()) {
+            continue;
+        }
+        int px = left;
+        while (px <= right) {
+            while (px <= right && !available(px, nextY)) {
+                ++px;
+            }
+            if (px <= right) {
+                fillTextureSpan(px, nextY, oldColor, visited);
+                while (px <= right && !available(px, nextY)) {
+                    ++px;
                 }
             }
         }
